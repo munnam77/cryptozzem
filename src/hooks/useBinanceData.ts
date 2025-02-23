@@ -1,81 +1,88 @@
 import { useState, useEffect } from 'react';
-import { binanceAPI } from '../lib/api/binance';
 
 interface PriceData {
   symbol: string;
   price: number;
-  change24h: number;
+  timestamp: number;
 }
 
-export function useBinanceData(symbols: string[]) {
-  const [prices, setPrices] = useState<PriceData[]>([]);
-  const [loading, setLoading] = useState(true);
+interface HistoricalPrice {
+  timestamp: number;
+  price: number;
+}
+
+export function useBinanceData(symbol: string, interval = '1m') {
+  const [realTimePrice, setRealTimePrice] = useState<PriceData | null>(null);
+  const [historicalPrices, setHistoricalPrices] = useState<HistoricalPrice[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    let mounted = true;
-    let unsubscribe: (() => void) | null = null;
+    const ws = new WebSocket('wss://stream.binance.com:9443/ws');
 
-    const fetchInitialData = async () => {
+    // Subscribe to price updates
+    ws.onopen = () => {
+      ws.send(JSON.stringify({
+        method: 'SUBSCRIBE',
+        params: [`${symbol.toLowerCase()}@trade`],
+        id: 1
+      }));
+    };
+
+    ws.onmessage = (event) => {
       try {
-        // Fetch initial price data
-        const pairs = await binanceAPI.getUSDTPairs();
-        const filteredPairs = pairs.filter(pair => symbols.includes(pair));
-        
-        if (filteredPairs.length === 0) {
-          throw new Error('No valid trading pairs found');
-        }
-        
-        // Subscribe to real-time updates
-        binanceAPI.subscribeToTickers(filteredPairs);
-        
-        unsubscribe = binanceAPI.subscribe((data) => {
-          if (!mounted) return;
-          
-          if (data.s === 'ERROR') {
-            setError('Connection to Binance lost. Please refresh the page.');
-            return;
-          }
-          
-          setPrices(current => {
-            const index = current.findIndex(p => p.symbol === data.s);
-            if (index === -1) {
-              return [...current, {
-                symbol: data.s,
-                price: parseFloat(data.c),
-                change24h: parseFloat(data.P)
-              }];
-            }
-            
-            const updated = [...current];
-            updated[index] = {
-              symbol: data.s,
-              price: parseFloat(data.c),
-              change24h: parseFloat(data.P)
-            };
-            return updated;
+        const data = JSON.parse(event.data);
+        if (data.e === 'trade') {
+          setRealTimePrice({
+            symbol: data.s,
+            price: parseFloat(data.p),
+            timestamp: data.T
           });
-        });
 
-        setLoading(false);
-      } catch (err) {
-        if (mounted) {
-          setError(err instanceof Error ? err.message : 'Failed to fetch data');
-          setLoading(false);
+          // Add to historical prices, keeping last 24 hours of minute data
+          setHistoricalPrices(prev => {
+            const newData = [...prev, { timestamp: data.T, price: parseFloat(data.p) }];
+            // Keep only last 1440 points (24 hours * 60 minutes)
+            return newData.slice(-1440);
+          });
         }
+      } catch (e) {
+        console.error('WebSocket message error:', e);
       }
     };
 
-    fetchInitialData();
+    ws.onerror = (error) => {
+      setError('WebSocket connection error');
+      console.error('WebSocket error:', error);
+    };
+
+    // Fetch historical data on mount
+    const fetchHistoricalData = async () => {
+      try {
+        const response = await fetch(
+          `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=1440`
+        );
+        const data = await response.json();
+        const formattedData = data.map((candle: any[]) => ({
+          timestamp: candle[0],
+          price: parseFloat(candle[4]) // Using close price
+        }));
+        setHistoricalPrices(formattedData);
+        setIsLoading(false);
+      } catch (e) {
+        setError('Failed to fetch historical data');
+        setIsLoading(false);
+      }
+    };
+
+    fetchHistoricalData();
 
     return () => {
-      mounted = false;
-      if (unsubscribe) {
-        unsubscribe();
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.close();
       }
-      binanceAPI.disconnect();
     };
-  }, [symbols]);
+  }, [symbol, interval]);
 
-  return { prices, loading, error };
+  return { realTimePrice, historicalPrices, error, isLoading };
 }
