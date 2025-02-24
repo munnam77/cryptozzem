@@ -114,3 +114,12 @@ export function DraggableGridItem({ item }: DraggableGridItemProps) {
       <div
         {...attributes}
         {...listeners}
+        className="absolute top-2 right-2 p-1 cursor-grab active:cursor-grabbing hover:bg-gray-100 dark:hover:bg-gray-800 rounded-md z-10"
+      >
+        <GripVertical className="w-4 h-4 text-gray-400" />
+      </div>
+      
+      {renderContent()}
+    </div>
+  );
+}
