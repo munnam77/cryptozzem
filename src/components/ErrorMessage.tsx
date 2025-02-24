@@ -1,15 +1,23 @@
 import React from 'react';
-import { AlertTriangle } from 'lucide-react';
+import { XCircle } from 'lucide-react';
+import { cn } from '../lib/utils';
 
 interface ErrorMessageProps {
   message: string;
+  className?: string;
 }
 
-export function ErrorMessage({ message }: ErrorMessageProps) {
+export function ErrorMessage({ message, className }: ErrorMessageProps) {
   return (
-    <div className="flex items-center justify-center p-4 bg-red-50 text-red-800 rounded-lg">
-      <AlertTriangle className="w-5 h-5 mr-2" />
-      <span>{message}</span>
+    <div 
+      data-testid="error-message"
+      className={cn(
+        "flex items-center space-x-2 p-4 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg",
+        className
+      )}
+    >
+      <XCircle className="h-5 w-5 text-red-500 dark:text-red-400" />
+      <span className="text-sm text-red-600 dark:text-red-300">{message}</span>
     </div>
   );
 }

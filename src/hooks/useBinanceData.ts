@@ -1,88 +1,149 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
+import { WebSocketManager } from '../lib/api/websocket';
+import { CacheManager } from '../lib/utils/cache';
+import { useAlerts } from '../contexts/AlertContext';
+import type { PriceData, HistoricalPrice, PriceAlert } from '../lib/types/price';
 
-interface PriceData {
-  symbol: string;
-  price: number;
-  timestamp: number;
-}
+const BINANCE_WS_URL = 'wss://stream.binance.com:9443/ws';
+const BINANCE_API_URL = 'https://api.binance.com/api/v3';
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache
 
-interface HistoricalPrice {
-  timestamp: number;
-  price: number;
-}
+export type { HistoricalPrice };  // Re-export the type
 
-export function useBinanceData(symbol: string, interval = '1m') {
+export function useBinanceData(symbol: string, interval = '1m', isVisible = true) {
+  const { alerts } = useAlerts();
   const [realTimePrice, setRealTimePrice] = useState<PriceData | null>(null);
   const [historicalPrices, setHistoricalPrices] = useState<HistoricalPrice[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const wsManager = useRef<WebSocketManager | null>(null);
+  const dataUpdateTimeout = useRef<NodeJS.Timeout>();
+
+  // Memoize alerts for the current symbol
+  const symbolAlerts = useMemo(() => 
+    alerts.filter(alert => alert.symbol === symbol && !alert.triggered),
+    [alerts, symbol]
+  );
 
   useEffect(() => {
-    const ws = new WebSocket('wss://stream.binance.com:9443/ws');
+    const cacheManager = CacheManager.getInstance();
+    const cacheKey = `${symbol}-${interval}-history`;
 
-    // Subscribe to price updates
-    ws.onopen = () => {
-      ws.send(JSON.stringify({
-        method: 'SUBSCRIBE',
-        params: [`${symbol.toLowerCase()}@trade`],
-        id: 1
-      }));
-    };
+    // Only establish WebSocket connection if widget is visible
+    if (isVisible) {
+      wsManager.current = new WebSocketManager(BINANCE_WS_URL);
+      wsManager.current.connect();
 
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.e === 'trade') {
+      const streamName = `${symbol.toLowerCase()}@trade`;
+      wsManager.current.subscribe(streamName, (data) => {
+        const currentPrice = parseFloat(data.p);
+        const currentVolume = parseFloat(data.q || '0');
+        
+        // Check price alerts
+        symbolAlerts.forEach(alert => {
+          if (alert.condition === 'above' && currentPrice >= alert.targetPrice) {
+            notifyAlert(alert, currentPrice);
+          } else if (alert.condition === 'below' && currentPrice <= alert.targetPrice) {
+            notifyAlert(alert, currentPrice);
+          }
+        });
+
+        // Batch price updates to reduce re-renders
+        if (dataUpdateTimeout.current) {
+          clearTimeout(dataUpdateTimeout.current);
+        }
+
+        dataUpdateTimeout.current = setTimeout(() => {
           setRealTimePrice({
             symbol: data.s,
-            price: parseFloat(data.p),
+            price: currentPrice,
+            volume: currentVolume,
             timestamp: data.T
           });
 
-          // Add to historical prices, keeping last 24 hours of minute data
           setHistoricalPrices(prev => {
-            const newData = [...prev, { timestamp: data.T, price: parseFloat(data.p) }];
-            // Keep only last 1440 points (24 hours * 60 minutes)
-            return newData.slice(-1440);
+            const newData = [...prev, { 
+              timestamp: data.T, 
+              price: currentPrice,
+              volume: currentVolume 
+            }].slice(-1440);
+            // Only cache if visible to avoid unnecessary storage
+            if (isVisible) {
+              cacheManager.set(cacheKey, newData, { ttl: CACHE_TTL });
+            }
+            return newData;
           });
-        }
-      } catch (e) {
-        console.error('WebSocket message error:', e);
-      }
-    };
+        }, 1000); // Batch updates every second
+      });
+    }
 
-    ws.onerror = (error) => {
-      setError('WebSocket connection error');
-      console.error('WebSocket error:', error);
-    };
-
-    // Fetch historical data on mount
+    // Fetch historical data if not in cache or if cached data is stale
     const fetchHistoricalData = async () => {
       try {
+        const cachedData = cacheManager.get<HistoricalPrice[]>(cacheKey);
+        if (cachedData) {
+          setHistoricalPrices(cachedData);
+          setIsLoading(false);
+          return;
+        }
+
         const response = await fetch(
-          `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=1440`
+          `${BINANCE_API_URL}/klines?symbol=${symbol}&interval=${interval}&limit=1440`
         );
+        
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
         const data = await response.json();
         const formattedData = data.map((candle: any[]) => ({
           timestamp: candle[0],
-          price: parseFloat(candle[4]) // Using close price
+          price: parseFloat(candle[4]), // Close price
+          volume: parseFloat(candle[5])  // Volume
         }));
+        
+        if (isVisible) {
+          cacheManager.set(cacheKey, formattedData, { ttl: CACHE_TTL });
+        }
+        
         setHistoricalPrices(formattedData);
         setIsLoading(false);
       } catch (e) {
-        setError('Failed to fetch historical data');
+        const errorMessage = e instanceof Error ? e.message : 'Failed to fetch historical data';
+        setError(errorMessage);
         setIsLoading(false);
+        console.error('Historical data fetch error:', e);
       }
     };
 
     fetchHistoricalData();
 
     return () => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.close();
+      if (dataUpdateTimeout.current) {
+        clearTimeout(dataUpdateTimeout.current);
+      }
+      if (wsManager.current) {
+        const streamName = `${symbol.toLowerCase()}@trade`;
+        wsManager.current.unsubscribe(streamName);
+        wsManager.current.disconnect();
       }
     };
-  }, [symbol, interval]);
+  }, [symbol, interval, isVisible, symbolAlerts]);
+
+  const notifyAlert = (alert: PriceAlert, currentPrice: number) => {
+    if (!isVisible) return; // Only show notifications for visible widgets
+    
+    if ('Notification' in window) {
+      if (Notification.permission === 'granted') {
+        new Notification(`Price Alert: ${symbol}`, {
+          body: `Price has gone ${alert.condition} $${alert.targetPrice} (Current: $${currentPrice})`,
+          icon: '/favicon.ico'
+        });
+      } else if (Notification.permission !== 'denied') {
+        Notification.requestPermission();
+      }
+    }
+  };
 
   return { realTimePrice, historicalPrices, error, isLoading };
 }
